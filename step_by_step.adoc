@@ -1,0 +1,448 @@
+== Setup OpenShift cluster in disconnected environment using UPI method
+
+* There are following steps to setup cluster in AWS
+. Download awscli
+. Set variables
+. Setup Mirror OpenShift 4 local registry
+. Extract the openshift-install binary from images
+. Create Installation Config
+. Create Manifest
+. Create Ignition Config
+. Create VPC
+. AWS DNS and Load Balancers
+. Setup VPC Peering
+. Add routes between vpc
+. Create AWS Security Groups
+. S3 Bucket for Bootstrap Ignition files
+. Create Bootstrap Instance
+. Create Control Plane (master) Instances
+. Connect to the Control Plane
+. Create Workers
+
+== Download AWS cli
+. Download awscli
++
+[source=text]
+----
+]$ sudo -i
+]# echo ${GUID}
+]# curl "https://s3.amazonaws.com/aws-cli/awscli-bundle.zip" -o "awscli-bundle.zip"
+]# unzip awscli-bundle.zip
+]# ./awscli-bundle/install -i /usr/local/aws -b /bin/aws
+]# aws --version
+]# rm -rf /root/awscli-bundle /root/awscli-bundle.zip
+]# exit
+----
+
+== Variables
+
+[source=textinfo]
+----
+]$ cat > export_bash_vars.yml <<EOF
+- name: Playbook to insert vars
+  hosts: localhost
+  tasks:
+    - name: Insert variables in .bashrc
+      lineinfile:
+        path: ~/.bashrc
+        regexp: 'EOF'
+        line: "export {{ item }}"
+      loop: "{{ export_bash_vars }}"
+EOF
+
+]$ cat > bash_vars.yml <<EOF
+export_bash_vars:
+  - AWSKEY=AAAAAAAAAAAAAAAAAAAAAAAA
+  - AWSSECRETKEY=0000000000000000000000000000000000000
+  - REGION=us-east-2
+  - OCP_RELEASE=4.6.16
+  - LOCAL_REGISTRY=utilityvm.$GUID.internal:5000
+  - LOCAL_REPOSITORY=ocp4/openshift4
+  - LOCAL_SECRET_JSON=$HOME/merged_pullsecret.json
+  - PRODUCT_REPO=openshift-release-dev
+  - RELEASE_NAME=ocp-release
+  - ARCHITECTURE=x86_64
+  - INFRA_ID=$(jq -r .infraID $HOME/aws-upi/metadata.json)
+  - CLUSTER_NAME=cluster-$GUID
+  - BASE_DOMAIN=sandbox460.opentlc.com
+  - KUBECONFIG=$HOME/aws-upi/auth/kubeconfig
+EOF
+
+]$ ansible-playbook export_bash_vars.yml -e @bash_vars.yml
+
+]$ source ~/.bashrc
+----
+
+==  Setup Mirror OpenShift 4 local registry in Utilityvm
+
+. Create Directory and generate self signed certificates
+
++
+[source=sh]
+----
+]$ cat << END > registry_pod_script.sh
+#!/bin/bash
+sudo mkdir -p /opt/registry/{auth,certs,data}
+sudo chown -R $USER /opt/registry
+sudo wget --quiet https://github.com/cloudflare/cfssl/releases/download/v1.5.0/cfssljson_1.5.0_linux_amd64 -O /usr/local/bin/cfssljson
+sudo wget --quiet https://github.com/cloudflare/cfssl/releases/download/v1.5.0/cfssl_1.5.0_linux_amd64 -O /usr/local/bin/cfssl
+sudo chmod 755 /usr/local/bin/cfssl /usr/local/bin/cfssljson
+cfssl version ; cfssljson --version
+cd /opt/registry/certs/
+## Copy config json
+cat << EOF > ca-config.json
+{ "signing": {
+    "default": {"expiry": "87600h" },
+    "profiles": {
+      "server": {"expiry": "87600h","usages": [ "signing","key encipherment","server auth" ]},
+      "client": {"expiry": "87600h","usages": [ "signing", "key encipherment","client auth" ]}
+      }
+    }
+}
+EOF
+
+cat << EOF > ca-csr.json
+{ "CN": "Red Hat GPTE",
+  "hosts": ["utilityvm.$GUID.internal"],
+  "key": {"algo": "rsa","size": 2048},
+  "names": [{"C": "US","ST": "Washington","L": "Seattle","OU": "GPTE"}]
+}
+EOF
+
+cat << EOF > server.json
+{ "CN": "Red Hat GPTE",
+  "hosts": ["utilityvm.$GUID.internal"],
+  "key": {"algo": "ecdsa","size": 256},
+  "names": [{"C": "US","ST": "Washington","L": "Seattle","OU": "GPTE"}]
+}
+EOF
+
+## copy end here ##
+cfssl gencert -initca ca-csr.json | cfssljson -bare ca -
+cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=server server.json | cfssljson -bare server
+cd $HOME
+htpasswd -bBc /opt/registry/auth/htpasswd openshift redhat
+END
+
+]$ chmod +x registry_pod_script.sh
+]$ ./registry_pod_script.sh
+----
+
+. Create Registry mirror container 
++
+[source=sh]
+----
+]$ cd; sudo python3 -m pip install podman-compose==0.1.5
+]$ cat >> podman-compose.yml <<EOF
+version: 2
+services:
+  mirror-registry:
+    image: 'docker.io/library/registry:2'
+    restart: always
+    hostname: 'mirror-registry'
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry Realm
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/server.pem
+      REGISTRY_HTTP_TLS_KEY: /certs/server-key.pem
+    ports:
+      - '5000:5000'
+    volumes:
+      - '/opt/registry/certs:/certs:z'
+      - '/opt/registry/data:/var/lib/registry:z'
+      - '/opt/registry/auth:/auth:z'
+EOF
+
+]$ podman-compose -f podman-compose.yml up -d
+]$ podman ps
+]$ curl -u openshift:redhat -k https://utilityvm.$GUID.internal:5000/v2/_catalog
+----
+
+. Add the certificates to utilityvm trusted store.
++
+[source=sh]
+----
+]$ curl -u openshift:redhat https://utilityvm.$GUID.internal:5000/v2/_catalog
+]$ sudo cp /opt/registry/certs/ca.pem /etc/pki/ca-trust/source/anchors
+]$ sudo update-ca-trust extract
+]$ curl -u openshift:redhat https://utilityvm.$GUID.internal:5000/v2/_catalog
+----
+
+. Test and  mirror the OpenShift 4 content to local registry
++
+[source=textinfo]
+----
+]$ podman pull ubi8/ubi:8.3
+]$ podman login -u openshift -p redhat utilityvm.$GUID.internal:5000
+]$ podman tag registry.access.redhat.com/ubi8/ubi:8.3 utilityvm.$GUID.internal:5000/ubi8/ubi:8.3
+]$ podman push utilityvm.$GUID.internal:5000/ubi8/ubi:8.3
+]$ ls /opt/registry/data/docker/registry/v2/repositories
+
+]$ oc adm -a ${LOCAL_SECRET_JSON} release mirror \
+   --from=quay.io/${PRODUCT_REPO}/${RELEASE_NAME}:${OCP_RELEASE}-${ARCHITECTURE} \
+   --to=${LOCAL_REGISTRY}/${LOCAL_REPOSITORY} \
+   --to-release-image=${LOCAL_REGISTRY}/${LOCAL_REPOSITORY}:${OCP_RELEASE}-${ARCHITECTURE}
+
+]$ podman pull --authfile $HOME/pullsecret_config.json utilityvm.$GUID.internal:5000/ocp4/openshift4:$OCP_RELEASE-operator-lifecycle-manager
+
+]$ podman images
+----
+
+== Prepare Installation Artifacts
+
+.  Extract the openshift-install binary from images 
++
+[source=textinfo]
+----
+]$ oc adm release extract -a ${LOCAL_SECRET_JSON} --command=openshift-install "${LOCAL_REGISTRY}/${LOCAL_REPOSITORY}:${OCP_RELEASE}-${ARCHITECTURE}"
+
+]$ sudo mv openshift-install /usr/local/sbin
+]$ sudo chown root:root /usr/local/sbin/openshift-install
+]$ openshift-install version
+----
+
+. Create Installation Config
++
+[source=textinfo]
+----
+]$ mkdir -p $HOME/aws-upi
+]$ cd $HOME/aws-upi
+]$ openshift-install create install-config --dir $HOME/aws-upi
+]$ vim install-config.yaml
+  imageContentSources: 
+  additionalTrustBundle: |
+
+]$ mkdir -p $HOME/backup
+]$ cp $HOME/aws-upi/install-config.yaml $HOME/backup
+----
+
+. Create Manifest
++
+[source=textinfo]
+----
+]$ openshift-install create manifests --dir $HOME/aws-upi
+
+]$ vim cat $HOME/aws-upi/manifests/cluster-scheduler-02-config.yml
+  mastersSchedulable: false
+]$ rm -f openshift/99_openshift-cluster-api_master-machines-*.yaml
+----
+
+. Create Ignition Config
++
+[source=textinfo]
+----
+
+]$ openshift-install create ignition-configs --dir $HOME/aws-upi
+----
+
+== AWS commands
+. Create VPC
++
+[source=text]
+----
+]$ aws cloudformation create-stack --stack-name ${INFRA_ID}-vpc \
+    --template-body file://~/resources/aws_upi_vpc_template.yaml \
+    --parameters file://~/resources/aws_upi_vpc_parameters.json
+
+]$ watch -n 5 aws cloudformation describe-stacks --stack-name $INFRA_ID-vpc --query Stacks[0].StackStatus
+
+]$ aws cloudformation describe-stacks --stack-name $INFRA_ID-vpc --query Stacks[0].Outputs[].[OutputKey,OutputValue] --output text | sed 's#\s#: #g' | tee ~/resources/vpc.txt >> ~/resources/cluster_vars.yaml
+----
+
+. AWS DNS and Load Balancers
++
+[source=text]
+----
+]$ aws route53 list-hosted-zones-by-name --dns-name $BASE_DOMAIN --query "HostedZones[?starts_with(Name, 'sandbox')].[Id,Name]" --output text
+
+]$ aws route53 list-hosted-zones-by-name --dns-name $BASE_DOMAIN --query "HostedZones[?starts_with(Name, 'sandbox')].[Id]" --output text | awk -F "/" '{print $3}' | xargs -I{} ansible localhost -m lineinfile "-a path=$HOME/resources/cluster_vars.yaml regexp='^HostedZoneId' line='HostedZoneId: {}'"
+
+]$ cd ~/resources
+]$ ansible-playbook ./process.yaml
+]$ cat ~/resources/aws_upi_route53_parameters.json
+
+]$ aws cloudformation create-stack --stack-name ${INFRA_ID}-dns \
+    --template-body file://~/resources/aws_upi_route53_template.yaml \
+    --parameters file://~/resources/aws_upi_route53_parameters.json \
+    --capabilities CAPABILITY_NAMED_IAM
+
+]$ watch -n 5 aws cloudformation describe-stacks --stack-name ${INFRA_ID}-dns --query Stacks[0].StackStatus
+
+]$ aws cloudformation describe-stacks --stack-name ${INFRA_ID}-dns --query Stacks[0].Outputs[].[OutputKey,OutputValue] --output text | sed 's_\s_: _g' | tee ~/resources/dns.txt >> ~/resources/cluster_vars.yaml
+
+]$ cat ~/resources/cluster_vars.yaml
+----
+
+. Setup VPC Peering
++
+[source=text]
+----
+]$ aws route53 list-hosted-zones --query "HostedZones[].[Id, Name]" --output text
+
+]$ aws ec2 describe-vpcs --query "Vpcs[].[VpcId,CidrBlock]" --output text
+
+]$ aws route53 associate-vpc-with-hosted-zone \
+--hosted-zone-id="<id of GUID.internal" \
+--vpc VPCRegion=us-east-2,VPCId=<new vpc for 10.0.0.0/16>
+
+]$ aws ec2 create-vpc-peering-connection --peer-vpc-id <New vpc id> --vpc-id <old vpc id>
+
+]$ aws ec2 describe-vpc-peering-connections --query VpcPeeringConnections[0].VpcPeeringConnectionId
+
+]$ aws ec2 accept-vpc-peering-connection --vpc-peering-connection-id <peering request ID>
+----
+
+. Add routes between vpc
++
+[source=text]
+----
+]$ aws ec2 describe-route-tables --query 'RouteTables[*].{TABLE:RouteTableId,VPC:VpcId,DEST:Routes[*].DestinationCidrBlock}' --output text
+
+]$ aws ec2 describe-vpc-peering-connections --query "VpcPeeringConnections[0].VpcPeeringConnectionId"
+
+]$ aws ec2 create-route --vpc-peering-connection-id pcx-0b0de976695d08c2b --destination-cidr-block "10.0.0.0/16" --route-table-id rtb-08bf631b1d2ac7e3b
+
+]$ aws ec2 create-route --vpc-peering-connection-id pcx-0b0de976695d08c2b --destination-cidr-block "10.0.0.0/16" --route-table-id rtb-0327e581c4a13a445
+
+]$ ]$ aws ec2 create-route --vpc-peering-connection-id pcx-0b0de976695d08c2b --destination-cidr-block "192.168.0.0/16" --route-table-id rtb-027deda6d293c4974
+
+]$ aws ec2 create-route --vpc-peering-connection-id pcx-0b0de976695d08c2b --destination-cidr-block "192.168.0.0/16" --route-table-id rtb-0c23b4aed523d9f0e
+
+]$ aws ec2 create-route --vpc-peering-connection-id pcx-0b0de976695d08c2b --destination-cidr-block "192.168.0.0/16" --route-table-id rtb-035dedc0df63d5aca
+
+----
+
+. Create AWS Security Groups
++
+[source=text]
+----
+]$ cat ~/resources/aws_upi_sec_parameters.json
+
+]$ aws cloudformation create-stack --stack-name ${INFRA_ID}-sec \
+    --template-body file://~/resources/aws_upi_sec_template.yaml \
+    --parameters file://~/resources/aws_upi_sec_parameters.json \
+    --capabilities CAPABILITY_NAMED_IAM
+
+]$ watch -n 5 aws cloudformation describe-stacks --stack-name $INFRA_ID-sec --query "Stacks[].StackStatus"
+
+]$ aws cloudformation describe-stacks --stack-name ${INFRA_ID}-sec --query Stacks[0].Outputs[].[OutputKey,OutputValue] --output text | sed 's_\s_: _g' | tee ~/resources/sec.txt >> ~/resources/cluster_vars.yaml
+
+]$ cat ~/resources/cluster_vars.yaml
+
+]$ cd $HOME/resources
+
+]$ ansible-playbook ./process.yaml
+----
+
+. S3 Bucket for Bootstrap Ignition files
++
+[source=text]
+----
+]$ aws s3 mb s3://${CLUSTER_NAME}-infra
+
+]$ aws s3 cp $HOME/aws-upi/bootstrap.ign s3://${CLUSTER_NAME}-infra/bootstrap.ign
+
+]$ aws s3 ls s3://${CLUSTER_NAME}-infra/
+----
+
+. Create Bootstrap Instance
++
+[source=text]
+----
+]$ cat ~/resources/aws_upi_bootstrap_parameters.json
+
+]$ aws cloudformation create-stack --stack-name ${INFRA_ID}-bootstrap \
+    --template-body file://~/resources/aws_upi_bootstrap_template.yaml \
+    --parameters file://~/resources/aws_upi_bootstrap_parameters.json \
+    --capabilities CAPABILITY_NAMED_IAM
+
+]$ watch -n 5 aws cloudformation describe-stacks --stack-name ${INFRA_ID}-bootstrap --query "Stacks[].StackStatus"
+
+]$ aws cloudformation describe-stacks --stack-name ${INFRA_ID}-bootstrap --query "Stacks[0].Outputs" --output text
+
+]$ ssh -i ~/.ssh/${GUID}key.pem core@10.0.10.80
+
+]$ journalctl -b -f -u release-image.service -u bootkube.service
+----
+
+. Create Control Plane (master) Instances
++
+[source=text]
+----
+]$ jq .ignition.security.tls.certificateAuthorities[0].source ~/aws-upi/master.ign
+
+]$ vim ~/resources/aws_upi_control_plane_parameters.json
+  {
+    "ParameterKey": "CertificateAuthorities",
+    "ParameterValue": "XXXX"
+  },
+
+]$ aws cloudformation create-stack --stack-name ${INFRA_ID}-control-plane \
+    --template-body file://~/resources/aws_upi_control_plane_template.yaml \
+    --parameters file://~/resources/aws_upi_control_plane_parameters.json
+
+]$ watch -n 5 aws cloudformation describe-stacks --stack-name ${INFRA_ID}-control-plane --query "Stacks[].StackStatus"
+
+]$ aws cloudformation describe-stacks --stack-name ${INFRA_ID}-control-plane --query "Stacks[].Outputs" --output text
+
+]$ sudo podman images
+
+]$ sudo cat /etc/containers/registries.conf
+
+]$ journalctl -b -f -u release-image.service -u bootkube.service
+
+]$ openshift-install wait-for bootstrap-complete --dir=$HOME/aws-upi --log-level=info
+
+]$ aws cloudformation delete-stack --stack-name ${INFRA_ID}-bootstrap
+
+----
+
+. Connect to the Control Plane
++
+[source=text]
+----
+]$ ansible localhost -m lineinfile -a 'path=$HOME/.bashrc regexp="^export KUBECONFIG" line="export KUBECONFIG=$HOME/aws-upi/auth/kubeconfig"'
+
+]$ source $HOME/.bashrc
+
+]$ oc get clusterversion
+]$ oc get clusteroperators
+----
+
+. Create Workers
++
+[source=text]
+----
+]$ jq .ignition.security.tls.certificateAuthorities[0].source ~/aws-upi/worker.ign
+
+]$ vim ~/resources/aws_upi_worker_parameters.json
+  {
+    "ParameterKey": "CertificateAuthorities",
+    "ParameterValue": "XXXX"
+  },
+
+]$ aws cloudformation create-stack --stack-name ${INFRA_ID}-worker-1 \
+    --template-body file://~/resources/aws_upi_worker_template.yaml \
+    --parameters file://~/resources/aws_upi_worker_parameters.json
+
+]$ aws cloudformation create-stack --stack-name ${INFRA_ID}-worker-2 \
+    --template-body file://~/resources/aws_upi_worker_template.yaml \
+    --parameters file://~/resources/aws_upi_worker_parameters.json
+
+]$ watch -n 5 'for i in 1 2; do aws cloudformation describe-stacks --stack-name ${INFRA_ID}-worker-${i} --query "Stacks[].StackStatus";done'
+
+]$ for i in 1 2; do aws cloudformation describe-stacks --stack-name ${INFRA_ID}-worker-${i} --query "Stacks[].Outputs" --output text; done
+
+]$ oc get csr
+
+]$ oc adm certificate approve csr-4rxq5
+
+]$ oc get nodes
+
+]$ watch -n 5 oc get co
+
+]$ oc get clusterversion
+
+]$ openshift-install wait-for install-complete --dir=$HOME/aws-upi
+----

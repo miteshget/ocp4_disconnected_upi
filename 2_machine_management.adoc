@@ -1,0 +1,183 @@
+== Machine API Operator 
+* The Machine API Operator is the OpenShift component that does all of the work here.
+
+. what exactly do you need to provide?
++
+[source=textinfo]
+----
+]$ oc explain MachineSet.spec --recursive=true
+----
+
+== Explore MachineSets and Machines
+
+. Retrieve the list of nodes 
++
+[source=textinfo]
+----
+]$ oc get nodes
+]$ oc describe node ip-10-0-52-45.us-east-2.compute.internal
+]$ oc get machines -n openshift-machine-api
+]$ oc get machineset -n openshift-machine-api
+]$ oc get machinesets cluster-abef-5tfqc-worker-us-east-2a -o yaml -n openshift-machine-api
+----
+
+. Scale a MachineSet
++
+[source=textinfo]
+----
+]$ oc get machineset -n openshift-machine-api
+]$ oc scale machineset cluster-abef-5tfqc-worker-us-east-2a --replicas=1 -n openshift-machine-api
+]$ oc get machineset -n openshift-machine-api 
+]$ oc get machine -n openshift-machine-api
+----
+
+. Debug
++
+[source=textinfo]
+----
+]$ oc describe machine cluster-8e69-vxsrc-worker-0-grjd9 -n openshift-machine-api
+]$ oc scale machineset cluster-bfaf-p952w-worker-us-east-2a --replicas=0 -n openshift-machine-api 
+]$ oc get machines -n openshift-machine-api 
+----
+
+. Create definition of the new MachineSet 
++
+[source=textinfo]
+----
+]$ oc get machineset cluster-bfaf-p952w-worker-us-east-2a -o yaml -n openshift-machine-api > $HOME/general-purpose-a.yaml
+
+]$ aws cloudformation describe-stacks --stack-name $INFRA_ID-vpc --query Stacks[0].Outputs
+]$ aws cloudformation describe-stacks --stack-name ${INFRA_ID}-sec --query="Stacks[].Outputs"
+
+]$ vim general-purpose-a.yaml
+]$ oc create -f ~/general-purpose-a.yaml -n openshift-machine-api
+]$ oc get machineset -n openshift-machine-api
+]$ oc scale machineset general-purpose-a --replicas=2 -n openshift-machine-api
+]$ oc get machines -n openshift-machine-api
+]$ oc get nodes
+----
+
+. Cleanup Workers
++
+[source=textinfo]
+----
+]$ oc adm cordon ip-10-0-48-246.us-east-2.compute.internal
+]$ oc adm drain node/ip-10-0-48-246.us-east-2.compute.internal --ignore-daemonsets --delete-local-data --force
+]$ oc get nodes
+]$ oc delete node ip-10-0-48-246.us-east-2.compute.internal ip-10-0-60-136.us-east-2.compute.internal
+]$ for i in 1 2; do aws cloudformation delete-stack --stack-name ${INFRA_ID}-worker-${i}; done
+----
+
+. Add an Infrastructure Node
++
+[source=textinfo]
+----
+]$ oc get machineset general-purpose-a -o yaml -n openshift-machine-api > $HOME/infra-a.yaml
+# modify infra-a.yml
+     name: infra-a
+     label:
+       node-role.kubernetes.io/infra: ""
+]$ oc create -f infra-a.yaml
+]$ oc get machines -n openshift-machine-api
+]$ oc get nodes
+----
+
+== Autoscaling
+
+. Create a Cluster Autoscaler
++
+[source=textinfo]
+----
+]$ oc explain clusterautoscaler.spec --recursive=true
+]$ oc explain clusterautoscaler.spec.balanceSimilarNodeGroups
+]$ oc project openshift-machine-api
+]$ oc get machineset
+
+]$ echo "
+apiVersion: autoscaling.openshift.io/v1beta1
+kind: MachineAutoscaler
+metadata:
+  name: ma-general-purpose-a
+  namespace: openshift-machine-api
+spec:
+  minReplicas: 2
+  maxReplicas: 8
+  scaleTargetRef:
+    apiVersion: machine.openshift.io/v1beta1
+    kind: MachineSet
+    name: general-purpose-a" | oc create -f - -n openshift-machine-api
+
+]$ oc get machineautoscaler
+
+]$ echo "
+apiVersion: autoscaling.openshift.io/v1
+kind: ClusterAutoscaler
+metadata:
+  name: default
+spec:
+  balanceSimilarNodeGroups: true
+  podPriorityThreshold: -10
+  resourceLimits:
+    maxNodesTotal: 12
+    cores:
+      min: 4
+      max: 48
+    memory:
+      min: 16
+      max: 156
+  scaleDown:
+    enabled: true
+    delayAfterAdd: 5m
+    delayAfterDelete: 5m
+    delayAfterFailure: 5m
+    unneededTime: 60s" | oc create -f -
+
+]$ oc get clusterautoscaler
+]$ oc describe clusterautoscaler default
+]$ oc get machineset general-purpose-a -o json | jq '.metadata.annotations'
+]$ oc get pods
+]$ oc logs -f cluster-autoscaler-default-84bfb94db8-2s698 -n openshift-machine-api
+----
+
+. Create load for autoscaler
++
+[source=textinfo]
+----
+]$ oc new-project work-queue
+
+]$ echo 'apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: work-queue-
+spec:
+  template:
+    spec:
+      containers:
+      - name: work
+        image: busybox
+        command: ["sleep",  "300"]
+        resources:
+          requests:
+            memory: 500Mi
+            cpu: 300m
+      restartPolicy: Never
+      nodeSelector:
+        node-role.kubernetes.io/general-use: ""
+  parallelism: 50
+  completions: 50' | oc create -f - -n work-queue
+
+]$ oc logs -f  cluster-autoscaler-default-ccfb69556-f96wf -n openshift-machine-api
+]$ watch -n 10 "oc get machines -n openshift-machine-api"
+]$ watch -n 10 "oc get nodes"
+----
+
+. Cleanup
++
+[source=textinfo]
+----
+]$ oc delete project work-queue
+]$ oc delete machineautoscaler ma-general-purpose-a -n openshift-machine-api
+]$ oc delete clusterautoscaler default
+
+
+----

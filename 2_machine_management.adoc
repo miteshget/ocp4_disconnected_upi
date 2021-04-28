@@ -68,8 +68,8 @@
 ]$ for i in 1 2; do aws cloudformation delete-stack --stack-name ${INFRA_ID}-worker-${i}; done
 ----
 
-. Add an Infrastructure Node
-+
+== Add an Infrastructure Node
+
 [source=textinfo]
 ----
 ]$ oc get machineset general-purpose-a -o yaml -n openshift-machine-api > $HOME/infra-a.yaml

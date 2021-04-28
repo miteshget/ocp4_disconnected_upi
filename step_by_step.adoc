@@ -1,7 +1,7 @@
 == Setup OpenShift cluster in disconnected environment using UPI method
 
 * There are following steps to setup cluster in AWS
-. Download awscli
+. Download awscli <1>
 . Set variables
 . Setup Mirror OpenShift 4 local registry
 . Extract the openshift-install binary from images
